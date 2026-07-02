@@ -25,7 +25,7 @@ const CONFIG = {
   numeroAdmin: "5219983411564",
 
   // Google Apps Script URL
-  sheetsUrl: "https://script.google.com/macros/s/AKfycbwBwalYtWX1Q1poTu4Re-p_npZbBj8rpIXhnzQ1sA2UHgxPhh-BKrZ0wp5r9AYgIOac/exec",
+  sheetsUrl: "https://script.google.com/macros/s/AKfycbzRoTMMk-lY55ZwLsNvJaGk_9p0YDzsKi6tu1jqShVyZVfJ-Be9V8sKsY2A_MssiEVL/exec",
 
   // Minutos sin actividad para cancelar sesión de fichaje
   expiracionMin: 5,
@@ -184,8 +184,21 @@ async function procesarMensaje(sock, msg) {
 
   // ── COMANDO INICIAL ──────────────────────────
   if (!sesion && (texto === "fichar" || texto === "hola" || texto === "fichaje")) {
-    setSesion(jid, { paso: "esperando_foto" });
-    return `👋 *Hola!* Soy el sistema de fichaje de *Hostel Che*.\n\n📸 Para registrar tu entrada o salida, primero envíame una *selfie* (foto tuya en este momento).`;
+    // Verificar si el número está registrado antes de continuar
+    const numero = jidANumero(jid);
+    const empleados = await sheetsGetEmpleados();
+    const empleado = empleados.find(e => {
+      const telSheet = String(e.telefono || "").replace(/\D/g, "");
+      const telWA = numero.replace(/\D/g, "");
+      return telSheet.slice(-10) === telWA.slice(-10);
+    });
+
+    if (!empleado) {
+      return `❌ Tu número no está registrado en el sistema de fichaje de *Hostel Che*.\n\nContacta a RRHH para que te den de alta.`;
+    }
+
+    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
+    return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, primero envíame una *selfie* (foto tuya en este momento).`;
   }
 
   if (!sesion) {
@@ -233,26 +246,22 @@ async function procesarMensaje(sock, msg) {
       return `❌ *Ubicación fuera de rango.*\n\nEstás a *${verificacion.distancia}m* de ${verificacion.cercana} (máximo permitido: 50m).\n\nSi crees que es un error, intenta de nuevo con *fichar*.`;
     }
 
-    setSesion(jid, { ...sesion, paso: "esperando_pin", lat, lng, sede: verificacion.sede });
-    return `✅ Ubicación verificada — *${verificacion.sede}* (${verificacion.distancia}m)\n\n🔐 Ahora escribe tu *PIN* de 4 dígitos.`;
-  }
-
-  // ── PASO 3: ESPERANDO PIN ────────────────────
-  if (sesion.paso === "esperando_pin") {
-    if (!/^\d{4}$/.test(texto)) {
-      setSesion(jid, sesion);
-      return `🔐 Por favor escribe tu *PIN de 4 dígitos*.`;
-    }
-
+    // Verificar empleado por número de teléfono
+    const numero = jidANumero(jid);
     const empleados = await sheetsGetEmpleados();
-    const empleado = empleados.find(e => String(e.pin) === texto);
+    const empleado = empleados.find(e => {
+      const telSheet = String(e.telefono || "").replace(/\D/g, "");
+      const telWA = numero.replace(/\D/g, "");
+      // Comparar últimos 10 dígitos para evitar diferencias de prefijo país
+      return telSheet.slice(-10) === telWA.slice(-10);
+    });
 
     if (!empleado) {
       delSesion(jid);
-      return `❌ *PIN incorrecto.* Sesión cancelada.\n\nEscribe *fichar* para intentar de nuevo.`;
+      return `❌ Tu número no está registrado en el sistema.\n\nContacta a RRHH para que te den de alta.`;
     }
 
-    // Determinar si es entrada o salida
+    // Determinar entrada o salida
     const logHoy = await sheetsGetLogHoy();
     const registrosEmpleado = logHoy
       .filter(r => String(r.empId) === String(empleado.id))
@@ -264,16 +273,16 @@ async function procesarMensaje(sock, msg) {
     const fecha = fechaStr();
     const ts = Date.now();
 
-    const ok = await sheetsFichar(empleado, tipoFichaje, hora, fecha, ts, sesion.sede, sesion.fotoPath);
+    const ok = await sheetsFichar(empleado, tipoFichaje, hora, fecha, ts, verificacion.sede, sesion.fotoPath);
     delSesion(jid);
 
     const emoji = tipoFichaje === "entrada" ? "🟢" : "🔴";
     const accion = tipoFichaje === "entrada" ? "Entrada registrada" : "Salida registrada";
 
     if (ok) {
-      return `${emoji} *${accion}*\n\n👤 ${empleado.name}\n🏨 ${sesion.sede}\n🕐 ${hora} — ${fecha}\n\n_Guardado en el sistema ✓_`;
+      return `${emoji} *${accion}*\n\n👤 ${empleado.name}\n🏨 ${verificacion.sede}\n🕐 ${hora} — ${fecha}\n\n_Guardado en el sistema ✓_`;
     } else {
-      return `⚠️ Fichaje registrado localmente pero hubo un error al sincronizar. Contacta a sistemas.`;
+      return `⚠️ Fichaje registrado pero hubo un error al sincronizar. Contacta a sistemas.`;
     }
   }
 
