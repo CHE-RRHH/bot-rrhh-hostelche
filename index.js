@@ -86,34 +86,39 @@ function fechaStr() {
 // ─────────────────────────────────────────────
 // 📊 GOOGLE SHEETS
 // ─────────────────────────────────────────────
-async function sheetsGetEmpleados() {
+async function sheetsGet(params) {
   try {
-    const url = `${CONFIG.sheetsUrl}?action=get_empleados&callback=cb`;
-    const res = await fetch(url);
+    const url = CONFIG.sheetsUrl + '?' + new URLSearchParams(params).toString();
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json' },
+      redirect: 'follow',
+    });
     const text = await res.text();
-    const json = text.replace(/^cb\(/, "").replace(/\)$/, "");
-    const data = JSON.parse(json);
-    return data.ok ? data.empleados : [];
+    // Handle both plain JSON and JSONP
+    const clean = text.replace(/^[^(]+\(/, '').replace(/\);?$/, '').trim();
+    return JSON.parse(clean);
   } catch (e) {
-    console.error("Error leyendo empleados:", e.message);
-    return [];
+    console.error("Sheets error:", e.message);
+    return { ok: false };
   }
 }
 
-async function sheetsGetLogHoy() {
-  try {
-    const now = new Date();
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    const endOfDay = startOfDay + 86400000;
-    const url = `${CONFIG.sheetsUrl}?action=get_log&ts_start=${startOfDay}&ts_end=${endOfDay}&callback=cb`;
-    const res = await fetch(url);
-    const text = await res.text();
-    const json = text.replace(/^cb\(/, "").replace(/\)$/, "");
-    const data = JSON.parse(json);
-    return data.ok ? data.log : [];
-  } catch (e) {
-    return [];
+async function sheetsGetEmpleados() {
+  const data = await sheetsGet({ action: 'get_empleados' });
+  if (data.ok) {
+    console.log(`📋 Empleados cargados: ${data.empleados.length}`);
+    return data.empleados;
   }
+  return [];
+}
+
+async function sheetsGetLogHoy() {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const endOfDay = startOfDay + 86400000;
+  const data = await sheetsGet({ action: 'get_log', ts_start: startOfDay, ts_end: endOfDay });
+  return data.ok ? data.log : [];
 }
 
 async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, fotoPath) {
