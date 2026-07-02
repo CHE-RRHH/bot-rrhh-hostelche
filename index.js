@@ -22,7 +22,7 @@ const CONFIG = {
   timeZone: "America/Cancun",
 
   // Número admin que recibe reportes (formato: 521XXXXXXXXXX)
-  numeroAdmin: "5219841138315",
+  numeroAdmin: "5219842326325",
 
   // Google Apps Script URL
   sheetsUrl: "https://script.google.com/macros/s/AKfycbzRoTMMk-lY55ZwLsNvJaGk_9p0YDzsKi6tu1jqShVyZVfJ-Be9V8sKsY2A_MssiEVL/exec",
