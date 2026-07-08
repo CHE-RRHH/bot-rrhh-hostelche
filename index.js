@@ -231,8 +231,17 @@ async function procesarMensaje(sock, msg) {
 
   // ── COMANDO INICIAL ──────────────────────────
   if (!sesion && (texto === "fichar" || texto === "hola" || texto === "fichaje")) {
-    // Verificar si el número está registrado antes de continuar
     const numero = jidANumero(jid);
+    const esLid = jid.endsWith("@lid");
+
+    if (esLid) {
+      // WhatsApp oculto el numero real detras de un ID de privacidad (@lid).
+      // Pedimos el telefono manualmente como respaldo.
+      console.log(`⚠️ JID tipo @lid detectado (${numero}), pidiendo telefono manual.`);
+      setSesion(jid, { paso: "esperando_telefono" });
+      return `👋 Hola! Para identificarte, escribe tu *número de teléfono* registrado en Hostel Che (10 dígitos, sin espacios).`;
+    }
+
     console.log(`🔍 Buscando empleado para numero: ${numero}`);
     const empleados = await sheetsGetEmpleados();
     const empleado = empleados.find(e => {
@@ -249,6 +258,27 @@ async function procesarMensaje(sock, msg) {
     console.log(`✅ Empleado encontrado: ${empleado.name} (id ${empleado.id})`);
     setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
     return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, primero envíame una *selfie* (foto tuya en este momento).`;
+  }
+
+  // ── PASO 0 (solo si el JID es @lid): ESPERANDO TELEFONO ──
+  if (sesion && sesion.paso === "esperando_telefono") {
+    const telIngresado = texto.replace(/\D/g, "");
+    if (telIngresado.length < 10) {
+      setSesion(jid, sesion);
+      return `Escribe tu número completo a 10 dígitos, por ejemplo: 9981234567`;
+    }
+    const empleados = await sheetsGetEmpleados();
+    const empleado = empleados.find(e => {
+      const telSheet = String(e.telefono || "").replace(/\D/g, "");
+      return telSheet.slice(-10) === telIngresado.slice(-10);
+    });
+    if (!empleado) {
+      delSesion(jid);
+      return `❌ Ese número no está registrado en el sistema de fichaje de *Hostel Che*.\n\nContacta a RRHH para que te den de alta.`;
+    }
+    console.log(`✅ Empleado identificado por telefono manual: ${empleado.name} (id ${empleado.id})`);
+    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
+    return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, envíame una *selfie* (foto tuya en este momento).`;
   }
 
   if (!sesion) {
@@ -292,19 +322,13 @@ async function procesarMensaje(sock, msg) {
       return `❌ *Ubicación fuera de rango.*\n\nEstás a *${verificacion.distancia}m* de ${verificacion.cercana} (máximo permitido: 50m).\n\nSi crees que es un error, intenta de nuevo con *fichar*.`;
     }
 
-    // Verificar empleado por número de teléfono
-    const numero = jidANumero(jid);
+    // Usar el empleado ya identificado en el paso inicial (por telefono o por @lid)
     const empleados = await sheetsGetEmpleados();
-    const empleado = empleados.find(e => {
-      const telSheet = String(e.telefono || "").replace(/\D/g, "");
-      const telWA = numero.replace(/\D/g, "");
-      // Comparar últimos 10 dígitos para evitar diferencias de prefijo país
-      return telSheet.slice(-10) === telWA.slice(-10);
-    });
+    const empleado = empleados.find(e => String(e.id) === String(sesion.empleadoId));
 
     if (!empleado) {
       delSesion(jid);
-      return `❌ Tu número no está registrado en el sistema.\n\nContacta a RRHH para que te den de alta.`;
+      return `❌ No se pudo confirmar tu identidad. Escribe *fichar* para intentar de nuevo.`;
     }
 
     // Determinar entrada o salida
