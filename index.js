@@ -7,12 +7,7 @@ import makeWASocket, {
 import { Boom } from "@hapi/boom";
 import pino from "pino";
 import qrcode from "qrcode-terminal";
-import { existsSync, mkdirSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
-import { fileURLToPath } from "url";
 import fetch from "node-fetch";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ─────────────────────────────────────────────
 // ⚙️  CONFIGURACIÓN
@@ -24,17 +19,26 @@ const CONFIG = {
   // Número admin que recibe reportes (formato: 521XXXXXXXXXX)
   numeroAdmin: "5219842326325",
 
-  // Google Apps Script URL
-  sheetsUrl: "https://script.google.com/macros/s/AKfycbzRoTMMk-lY55ZwLsNvJaGk_9p0YDzsKi6tu1jqShVyZVfJ-Be9V8sKsY2A_MssiEVL/exec",
+  // Google Apps Script URL (sistema de fichaje — chehostel-fichaje)
+  sheetsUrl: "https://script.google.com/macros/s/AKfycbwJ-d2SuAE3o5mdyrZVhFQ82PMPUa935PlDIiqk3BNXCFhep0QkcQENQXlgyFvtjrq1/exec",
 
   // Minutos sin actividad para cancelar sesión de fichaje
   expiracionMin: 5,
 
-  // Sedes con coordenadas y radio en metros
+  // Sedes con coordenadas y radio en metros (mismas 12 que el sistema web)
   sedes: [
-    { nombre: "Oficina",        lat: 20.623033, lng: -87.079929, radio: 50 },
-    { nombre: "Che Playa",      lat: 20.626184, lng: -87.075446, radio: 50 },
-    { nombre: "Che Suite Playa",lat: 20.620354, lng: -87.077728, radio: 50 },
+    { nombre: "Oficinas EUN",     lat: 20.623011, lng: -87.079899, radio: 100 },
+    { nombre: "Che Playa",        lat: 20.626166, lng: -87.075494, radio: 100 },
+    { nombre: "Che Tulum",        lat: 20.213802, lng: -87.456531, radio: 100 },
+    { nombre: "Che Holbox",       lat: 21.521428, lng: -87.374776, radio: 100 },
+    { nombre: "Che Bacalar",      lat: 18.682165, lng: -88.386827, radio: 100 },
+    { nombre: "Che Merida",       lat: 20.973264, lng: -89.623262, radio: 100 },
+    { nombre: "Che Valladolid",   lat: 20.687649, lng: -88.201307, radio: 100 },
+    { nombre: "Che Puerto",       lat: 15.835287, lng: -97.041735, radio: 100 },
+    { nombre: "Che Zipolite",     lat: 15.663439, lng: -96.519244, radio: 100 },
+    { nombre: "Che San Cristobal",lat: 16.738113, lng: -92.635435, radio: 100 },
+    { nombre: "Che Suite Playa",  lat: 20.620334, lng: -87.077838, radio: 100 },
+    { nombre: "Che Suite Tulum",  lat: 20.214102, lng: -87.456717, radio: 100 },
   ],
 };
 
@@ -82,6 +86,14 @@ function fechaStr() {
     timeZone: CONFIG.timeZone, day: "numeric", month: "numeric", year: "numeric"
   });
 }
+function fechaISO() {
+  const d = new Date(new Date().toLocaleString("en-US", { timeZone: CONFIG.timeZone }));
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function horaGuion() {
+  return horaStr().replace(":", "-");
+}
 
 // ─────────────────────────────────────────────
 // 📊 GOOGLE SHEETS
@@ -121,7 +133,7 @@ async function sheetsGetLogHoy() {
   return data.ok ? data.log : [];
 }
 
-async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, fotoPath) {
+async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, tieneFoto) {
   try {
     const params = new URLSearchParams({
       action: "fichar",
@@ -132,7 +144,7 @@ async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, fotoPath) {
       hora,
       fecha,
       ts,
-      foto: fotoPath ? "Sí (WhatsApp)" : "No",
+      foto: tieneFoto ? "Sí (WhatsApp)" : "No",
       ubicacion: sede,
       maps: "",
       canal: "WhatsApp",
@@ -141,6 +153,32 @@ async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, fotoPath) {
     return true;
   } catch (e) {
     console.error("Error guardando fichaje:", e.message);
+    return false;
+  }
+}
+
+async function subirFotoADrive(buffer, empleado, tipo) {
+  try {
+    const b64 = `data:image/jpeg;base64,${buffer.toString("base64")}`;
+    const body = JSON.stringify({
+      action: "guardar_selfie_fichaje",
+      empId: empleado.id,
+      nombre: empleado.name,
+      apellido: empleado.apellido || "",
+      fecha: fechaISO(),
+      hora: horaGuion(),
+      tipo,
+      b64: encodeURIComponent(b64),
+    });
+    const res = await fetch(CONFIG.sheetsUrl, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body,
+    });
+    const data = await res.json();
+    return !!data.ok;
+  } catch (e) {
+    console.error("Error subiendo foto a Drive:", e.message);
     return false;
   }
 }
@@ -218,19 +256,15 @@ async function procesarMensaje(sock, msg) {
       return `📸 Necesito que me envíes una *selfie* (foto). Por favor tómate una foto y envíala.`;
     }
 
-    // Guardar foto
-    let fotoPath = null;
+    // Guardar foto en memoria (no en disco: Railway borra el disco en cada redeploy)
+    let fotoBuffer = null;
     try {
-      const buffer = await downloadMediaMessage(msg, "buffer", {});
-      const fotosDir = join(__dirname, "fotos");
-      if (!existsSync(fotosDir)) mkdirSync(fotosDir, { recursive: true });
-      fotoPath = join(fotosDir, `${jidANumero(jid)}_${Date.now()}.jpg`);
-      writeFileSync(fotoPath, buffer);
+      fotoBuffer = await downloadMediaMessage(msg, "buffer", {});
     } catch (e) {
-      console.error("Error guardando foto:", e.message);
+      console.error("Error descargando foto:", e.message);
     }
 
-    setSesion(jid, { ...sesion, paso: "esperando_ubicacion", fotoPath });
+    setSesion(jid, { ...sesion, paso: "esperando_ubicacion", fotoBuffer });
     return `✅ Foto recibida.\n\n📍 Ahora comparte tu *ubicación actual*.\n\n_En WhatsApp: pulsa el clip 📎 → Ubicación → Enviar mi ubicación actual_`;
   }
 
@@ -278,7 +312,10 @@ async function procesarMensaje(sock, msg) {
     const fecha = fechaStr();
     const ts = Date.now();
 
-    const ok = await sheetsFichar(empleado, tipoFichaje, hora, fecha, ts, verificacion.sede, sesion.fotoPath);
+    const [ok] = await Promise.all([
+      sheetsFichar(empleado, tipoFichaje, hora, fecha, ts, verificacion.sede, !!sesion.fotoBuffer),
+      sesion.fotoBuffer ? subirFotoADrive(sesion.fotoBuffer, empleado, tipoFichaje) : Promise.resolve(false),
+    ]);
     delSesion(jid);
 
     const emoji = tipoFichaje === "entrada" ? "🟢" : "🔴";
