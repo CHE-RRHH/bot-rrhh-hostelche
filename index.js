@@ -107,8 +107,11 @@ async function sheetsGet(params) {
       redirect: 'follow',
     });
     const text = await res.text();
-    // Handle both plain JSON and JSONP
-    const clean = text.replace(/^[^(]+\(/, '').replace(/\);?$/, '').trim();
+    const trimmed = text.trim();
+    // Solo intentar limpiar como JSONP si de verdad no parece JSON plano
+    const clean = (trimmed.startsWith('{') || trimmed.startsWith('['))
+      ? trimmed
+      : trimmed.replace(/^[^(]+\(/, '').replace(/\);?$/, '').trim();
     return JSON.parse(clean);
   } catch (e) {
     console.error("Sheets error:", e.message);
