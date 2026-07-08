@@ -236,8 +236,19 @@ async function procesarMensaje(sock, msg) {
 
     if (esLid) {
       // WhatsApp oculto el numero real detras de un ID de privacidad (@lid).
-      // Pedimos el telefono manualmente como respaldo.
       console.log(`⚠️ JID tipo @lid detectado (${numero}), pidiendo telefono manual.`);
+      console.log(`🔬 msg.key completo:`, JSON.stringify(msg.key));
+      console.log(`🔬 msg.pushName:`, msg.pushName);
+      try {
+        if (sock.signalRepository?.lidMapping?.getPNForLID) {
+          const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
+          console.log(`🔬 Intento de resolver PN real desde LID:`, pn);
+        } else {
+          console.log(`🔬 sock.signalRepository.lidMapping no disponible en esta version de Baileys.`);
+        }
+      } catch (lidErr) {
+        console.log(`🔬 Error intentando resolver LID:`, lidErr.message);
+      }
       setSesion(jid, { paso: "esperando_telefono" });
       return `👋 Hola! Para identificarte, escribe tu *número de teléfono* registrado en Hostel Che (10 dígitos, sin espacios).`;
     }
