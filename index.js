@@ -229,31 +229,14 @@ async function procesarMensaje(sock, msg) {
   ).trim().toLowerCase();
   console.log(`📝 Texto extraido: "${texto}" | sesion previa: ${sesion ? sesion.paso : 'ninguna'}`);
 
+  // JID real para IDENTIFICAR y para RESPONDER (WhatsApp a veces oculta el
+  // numero real detras de un "@lid"; el numero de verdad viene en senderPn).
+  const jidEnvio = msg.key.senderPn || jid;
+  const numero = jidANumero(jidEnvio);
+
   // ── COMANDO INICIAL ──────────────────────────
   if (!sesion && (texto === "fichar" || texto === "hola" || texto === "fichaje")) {
-    const numero = jidANumero(jid);
-    const esLid = jid.endsWith("@lid");
-
-    if (esLid) {
-      // WhatsApp oculto el numero real detras de un ID de privacidad (@lid).
-      console.log(`⚠️ JID tipo @lid detectado (${numero}), pidiendo telefono manual.`);
-      console.log(`🔬 msg.key completo:`, JSON.stringify(msg.key));
-      console.log(`🔬 msg.pushName:`, msg.pushName);
-      try {
-        if (sock.signalRepository?.lidMapping?.getPNForLID) {
-          const pn = await sock.signalRepository.lidMapping.getPNForLID(jid);
-          console.log(`🔬 Intento de resolver PN real desde LID:`, pn);
-        } else {
-          console.log(`🔬 sock.signalRepository.lidMapping no disponible en esta version de Baileys.`);
-        }
-      } catch (lidErr) {
-        console.log(`🔬 Error intentando resolver LID:`, lidErr.message);
-      }
-      setSesion(jid, { paso: "esperando_telefono" });
-      return `👋 Hola! Para identificarte, escribe tu *número de teléfono* registrado en Hostel Che (10 dígitos, sin espacios).`;
-    }
-
-    console.log(`🔍 Buscando empleado para numero: ${numero}`);
+    console.log(`🔍 Buscando empleado para numero: ${numero} (jid original: ${jid})`);
     const empleados = await sheetsGetEmpleados();
     const empleado = empleados.find(e => {
       const telSheet = String(e.telefono || "").replace(/\D/g, "");
@@ -267,29 +250,8 @@ async function procesarMensaje(sock, msg) {
     }
 
     console.log(`✅ Empleado encontrado: ${empleado.name} (id ${empleado.id})`);
-    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
+    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id, jidEnvio });
     return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, primero envíame una *selfie* (foto tuya en este momento).`;
-  }
-
-  // ── PASO 0 (solo si el JID es @lid): ESPERANDO TELEFONO ──
-  if (sesion && sesion.paso === "esperando_telefono") {
-    const telIngresado = texto.replace(/\D/g, "");
-    if (telIngresado.length < 10) {
-      setSesion(jid, sesion);
-      return `Escribe tu número completo a 10 dígitos, por ejemplo: 9981234567`;
-    }
-    const empleados = await sheetsGetEmpleados();
-    const empleado = empleados.find(e => {
-      const telSheet = String(e.telefono || "").replace(/\D/g, "");
-      return telSheet.slice(-10) === telIngresado.slice(-10);
-    });
-    if (!empleado) {
-      delSesion(jid);
-      return `❌ Ese número no está registrado en el sistema de fichaje de *Hostel Che*.\n\nContacta a RRHH para que te den de alta.`;
-    }
-    console.log(`✅ Empleado identificado por telefono manual: ${empleado.name} (id ${empleado.id})`);
-    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
-    return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, envíame una *selfie* (foto tuya en este momento).`;
   }
 
   if (!sesion) {
@@ -462,15 +424,16 @@ async function conectar() {
         if (ignorados.includes(tipoMsg)) continue;
 
         const jid = msg.key.remoteJid;
-        const nombre = msg.pushName || jidANumero(jid);
+        const jidEnvio = msg.key.senderPn || jid;
+        const nombre = msg.pushName || jidANumero(jidEnvio);
         console.log(`📨 ${nombre}: ${tipoMsg}`);
 
         const respuesta = await procesarMensaje(sock, msg);
         console.log(`💬 Respuesta generada: ${respuesta ? respuesta.slice(0,60) : '(null, no responde)'}`);
         if (respuesta) {
           try {
-            await sock.sendMessage(jid, { text: respuesta });
-            console.log(`📤 Mensaje enviado a ${jidANumero(jid)}`);
+            await sock.sendMessage(jidEnvio, { text: respuesta });
+            console.log(`📤 Mensaje enviado a ${jidANumero(jidEnvio)} (jid original: ${jid})`);
           } catch (sendErr) {
             console.error(`🔴 Error al enviar mensaje:`, sendErr.message);
           }
