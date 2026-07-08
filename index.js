@@ -227,11 +227,13 @@ async function procesarMensaje(sock, msg) {
     msg.message?.extendedTextMessage?.text ||
     ""
   ).trim().toLowerCase();
+  console.log(`📝 Texto extraido: "${texto}" | sesion previa: ${sesion ? sesion.paso : 'ninguna'}`);
 
   // ── COMANDO INICIAL ──────────────────────────
   if (!sesion && (texto === "fichar" || texto === "hola" || texto === "fichaje")) {
     // Verificar si el número está registrado antes de continuar
     const numero = jidANumero(jid);
+    console.log(`🔍 Buscando empleado para numero: ${numero}`);
     const empleados = await sheetsGetEmpleados();
     const empleado = empleados.find(e => {
       const telSheet = String(e.telefono || "").replace(/\D/g, "");
@@ -240,9 +242,11 @@ async function procesarMensaje(sock, msg) {
     });
 
     if (!empleado) {
+      console.log(`❌ No se encontro empleado con ese numero.`);
       return `❌ Tu número no está registrado en el sistema de fichaje de *Hostel Che*.\n\nContacta a RRHH para que te den de alta.`;
     }
 
+    console.log(`✅ Empleado encontrado: ${empleado.name} (id ${empleado.id})`);
     setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id });
     return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, primero envíame una *selfie* (foto tuya en este momento).`;
   }
@@ -427,8 +431,14 @@ async function conectar() {
         console.log(`📨 ${nombre}: ${tipoMsg}`);
 
         const respuesta = await procesarMensaje(sock, msg);
+        console.log(`💬 Respuesta generada: ${respuesta ? respuesta.slice(0,60) : '(null, no responde)'}`);
         if (respuesta) {
-          await sock.sendMessage(jid, { text: respuesta });
+          try {
+            await sock.sendMessage(jid, { text: respuesta });
+            console.log(`📤 Mensaje enviado a ${jidANumero(jid)}`);
+          } catch (sendErr) {
+            console.error(`🔴 Error al enviar mensaje:`, sendErr.message);
+          }
         }
       } catch (error) {
         console.error("❌ Error:", error.message);
