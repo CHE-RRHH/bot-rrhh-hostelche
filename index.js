@@ -1,449 +1,818 @@
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  downloadMediaMessage,
-} from "@whiskeysockets/baileys";
-import { Boom } from "@hapi/boom";
-import pino from "pino";
-import qrcode from "qrcode-terminal";
-import fetch from "node-fetch";
+const SHEET_ID = '16ucJYG-fAzRs4ZjK_eF7rnGmGaqYnZgSRtCfto1QGPw';
+const DRIVE_FOLDER_ID = '1doWm3fsbgzZezx3bucF-FQEt6GgU0H9u';
+const FICHAR_BASE_URL = 'https://chehostel-fichaje.pages.dev/fichar.html';
 
-// ─────────────────────────────────────────────
-// ⚙️  CONFIGURACIÓN
-// ─────────────────────────────────────────────
-const CONFIG = {
-  // Zona horaria
-  timeZone: "America/Cancun",
-
-  // Número admin que recibe reportes (formato: 521XXXXXXXXXX)
-  numeroAdmin: "5219842326325",
-
-  // Google Apps Script URL (sistema de fichaje — chehostel-fichaje)
-  sheetsUrl: "https://script.google.com/macros/s/AKfycbwJ-d2SuAE3o5mdyrZVhFQ82PMPUa935PlDIiqk3BNXCFhep0QkcQENQXlgyFvtjrq1/exec",
-
-  // Minutos sin actividad para cancelar sesión de fichaje
-  expiracionMin: 5,
-
-  // Sedes con coordenadas y radio en metros (mismas 12 que el sistema web)
-  sedes: [
-    { nombre: "Oficinas EUN",     lat: 20.623011, lng: -87.079899, radio: 100 },
-    { nombre: "Che Playa",        lat: 20.626166, lng: -87.075494, radio: 100 },
-    { nombre: "Che Tulum",        lat: 20.213802, lng: -87.456531, radio: 100 },
-    { nombre: "Che Holbox",       lat: 21.521428, lng: -87.374776, radio: 100 },
-    { nombre: "Che Bacalar",      lat: 18.682165, lng: -88.386827, radio: 100 },
-    { nombre: "Che Merida",       lat: 20.973264, lng: -89.623262, radio: 100 },
-    { nombre: "Che Valladolid",   lat: 20.687649, lng: -88.201307, radio: 100 },
-    { nombre: "Che Puerto",       lat: 15.835287, lng: -97.041735, radio: 100 },
-    { nombre: "Che Zipolite",     lat: 15.663439, lng: -96.519244, radio: 100 },
-    { nombre: "Che San Cristobal",lat: 16.738113, lng: -92.635435, radio: 100 },
-    { nombre: "Che Suite Playa",  lat: 20.620334, lng: -87.077838, radio: 100 },
-    { nombre: "Che Suite Tulum",  lat: 20.214102, lng: -87.456717, radio: 100 },
-  ],
-};
-
-// ─────────────────────────────────────────────
-// 📍 UTILIDADES DE UBICACIÓN
-// ─────────────────────────────────────────────
-function distanciaMetros(lat1, lng1, lat2, lng2) {
-  const R = 6371000;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-    Math.cos((lat2 * Math.PI) / 180) *
-    Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-function verificarUbicacion(lat, lng) {
-  for (const sede of CONFIG.sedes) {
-    const dist = distanciaMetros(lat, lng, sede.lat, sede.lng);
-    if (dist <= sede.radio) {
-      return { ok: true, sede: sede.nombre, distancia: Math.round(dist) };
-    }
+function doGet(e) {
+  const data = e.parameter;
+  const result = handleRequest(data);
+  if (data.callback) {
+    return ContentService
+      .createTextOutput(data.callback + '(' + result + ')')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
   }
-  const cercana = CONFIG.sedes
-    .map(s => ({ ...s, dist: Math.round(distanciaMetros(lat, lng, s.lat, s.lng)) }))
-    .sort((a, b) => a.dist - b.dist)[0];
-  return { ok: false, cercana: cercana.nombre, distancia: cercana.dist };
+  return ContentService.createTextOutput(result).setMimeType(ContentService.MimeType.JSON);
 }
 
-// ─────────────────────────────────────────────
-// 🕐 HORA LOCAL
-// ─────────────────────────────────────────────
-function ahoraLocal() {
-  return new Date().toLocaleString("es-MX", { timeZone: CONFIG.timeZone });
-}
-function horaStr() {
-  return new Date().toLocaleTimeString("es-MX", {
-    timeZone: CONFIG.timeZone, hour: "2-digit", minute: "2-digit"
-  });
-}
-function fechaStr() {
-  return new Date().toLocaleDateString("es-MX", {
-    timeZone: CONFIG.timeZone, day: "numeric", month: "numeric", year: "numeric"
-  });
-}
-function fechaISO() {
-  const d = new Date(new Date().toLocaleString("en-US", { timeZone: CONFIG.timeZone }));
-  const pad = n => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-function horaGuion() {
-  return horaStr().replace(":", "-");
-}
-
-// ─────────────────────────────────────────────
-// 📊 GOOGLE SHEETS
-// ─────────────────────────────────────────────
-async function sheetsGet(params) {
+function doPost(e) {
   try {
-    const url = CONFIG.sheetsUrl + '?' + new URLSearchParams(params).toString();
-    const res = await fetch(url, {
-      method: 'GET',
-      headers: { 'Content-Type': 'application/json' },
-      redirect: 'follow',
-    });
-    const text = await res.text();
-    const trimmed = text.trim();
-    // Solo intentar limpiar como JSONP si de verdad no parece JSON plano
-    const clean = (trimmed.startsWith('{') || trimmed.startsWith('['))
-      ? trimmed
-      : trimmed.replace(/^[^(]+\(/, '').replace(/\);?$/, '').trim();
-    return JSON.parse(clean);
-  } catch (e) {
-    console.error("Sheets error:", e.message);
-    return { ok: false };
+    const data = JSON.parse(e.postData.contents);
+    return ContentService.createTextOutput(handleRequest(data)).setMimeType(ContentService.MimeType.JSON);
+  } catch(err) {
+    return ContentService.createTextOutput(JSON.stringify({ok:false,error:err.message})).setMimeType(ContentService.MimeType.JSON);
   }
 }
 
-async function sheetsGetEmpleados() {
-  const data = await sheetsGet({ action: 'get_empleados' });
-  if (data.ok) {
-    console.log(`📋 Empleados cargados: ${data.empleados.length}`);
-    return data.empleados;
-  }
-  return [];
-}
-
-async function sheetsGetLogHoy() {
-  const now = new Date();
-  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-  const endOfDay = startOfDay + 86400000;
-  const data = await sheetsGet({ action: 'get_log', ts_start: startOfDay, ts_end: endOfDay });
-  return data.ok ? data.log : [];
-}
-
-async function sheetsFichar(empleado, tipo, hora, fecha, ts, sede, tieneFoto) {
+function crearCarpetaEmpleado(nombre, apellido, id) {
   try {
-    const params = new URLSearchParams({
-      action: "fichar",
-      empId: empleado.id,
-      nombre: empleado.name,
-      dept: empleado.dept,
-      tipo,
-      hora,
-      fecha,
-      ts,
-      foto: tieneFoto ? "Sí (WhatsApp)" : "No",
-      ubicacion: sede,
-      maps: "",
-      canal: "WhatsApp",
-    });
-    await fetch(`${CONFIG.sheetsUrl}?${params.toString()}`, { method: "GET" });
-    return true;
-  } catch (e) {
-    console.error("Error guardando fichaje:", e.message);
-    return false;
+    const carpetaRaiz = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    const nombreCarpeta = `${nombre} ${apellido || ''} [${id}]`.trim();
+    const existing = carpetaRaiz.getFoldersByName(nombreCarpeta);
+    if (existing.hasNext()) {
+      return existing.next().getUrl();
+    }
+    const nuevaCarpeta = carpetaRaiz.createFolder(nombreCarpeta);
+    nuevaCarpeta.createFolder('Identificacion');
+    nuevaCarpeta.createFolder('Contrato');
+    nuevaCarpeta.createFolder('IMSS');
+    nuevaCarpeta.createFolder('Comprobante domicilio');
+    nuevaCarpeta.createFolder('Otros');
+    return nuevaCarpeta.getUrl();
+  } catch(e) {
+    return '';
   }
 }
 
-async function subirFotoADrive(buffer, empleado, tipo) {
+function handleRequest(data) {
   try {
-    const b64 = `data:image/jpeg;base64,${buffer.toString("base64")}`;
-    const body = JSON.stringify({
-      action: "guardar_selfie_fichaje",
-      empId: empleado.id,
-      nombre: empleado.name,
-      apellido: empleado.apellido || "",
-      fecha: fechaISO(),
-      hora: horaGuion(),
-      tipo,
-      b64: encodeURIComponent(b64),
-    });
-    const res = await fetch(CONFIG.sheetsUrl, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body,
-    });
-    const data = await res.json();
-    return !!data.ok;
-  } catch (e) {
-    console.error("Error subiendo foto a Drive:", e.message);
-    return false;
-  }
-}
+    const ss = SpreadsheetApp.openById(SHEET_ID);
 
-// ─────────────────────────────────────────────
-// 🗃️ ESTADO DE SESIONES (en memoria)
-// ─────────────────────────────────────────────
-const sesiones = new Map();
-// Estado: esperando_foto | esperando_ubicacion | esperando_pin
+    if (data.action === 'get_empleados') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ok:true, empleados:[]});
+      const tz = Session.getScriptTimeZone() || 'America/Cancun';
+      const fmtFecha = v => v instanceof Date ? Utilities.formatDate(v, tz, 'dd/MM/yyyy') : String(v || '');
+      const rows = sheet.getDataRange().getValues();
+      const empleados = rows.slice(1).filter(r => r[0]).map(r => ({
+        id: String(r[0]), name: String(r[1]), apellido: String(r[2]||''),
+        genero: String(r[3]||''), puesto: String(r[4]||''), dept: String(r[5]||''),
+        sede: String(r[6]||''), fechaIngreso: fmtFecha(r[7]),
+        telefono: String(r[8]||''), email: String(r[9]||''),
+        curp: String(r[10]||''), rfc: String(r[11]||''),
+        direccion: String(r[12]||''), contactoEmergencia: String(r[13]||''),
+        telefonoEmergencia: String(r[14]||''), pin: String(r[15]||'0000'),
+        color: Number(r[16])||0, foto: String(r[17]||''),
+        estado: String(r[18]||'activo'), driveUrl: String(r[19]||''),
+        fechaNacimiento: fmtFecha(r[20]),
+        sinGPS: String(r[21]||'').toLowerCase()==='si',
+        sinFoto: String(r[23]||'').toLowerCase()==='si',
+        puedeHomeOffice: String(r[24]||'').toLowerCase()==='si',
+      }));
+      return JSON.stringify({ok:true, empleados});
+    }
 
-function getSesion(jid) { return sesiones.get(jid) || null; }
-function setSesion(jid, data) {
-  sesiones.set(jid, { ...data, ultimaActividad: Date.now() });
-}
-function delSesion(jid) { sesiones.delete(jid); }
+    if (data.action === 'get_log') {
+      let sheet = ss.getSheetByName('Fichajes');
+      if (!sheet) return JSON.stringify({ok:true, log:[]});
+      const tsStart = Number(data.ts_start);
+      const tsEnd = Number(data.ts_end);
+      const tz = Session.getScriptTimeZone() || 'America/Cancun';
+      const rows = sheet.getDataRange().getValues();
+      const log = rows.slice(1).filter(r => {
+        const ts = Number(r[6]);
+        return ts >= tsStart && ts <= tsEnd;
+      }).map(r => {
+        const horaVal = r[4];
+        const fechaVal = r[5];
+        const hora = horaVal instanceof Date ? Utilities.formatDate(horaVal, tz, 'HH:mm') : String(horaVal || '');
+        const dateStr = fechaVal instanceof Date ? Utilities.formatDate(fechaVal, tz, 'dd/MM/yyyy') : String(fechaVal || '');
+        return {
+          empId: String(r[0]), nombre: String(r[1]), dept: String(r[2]),
+          type: String(r[3]), hora, dateStr,
+          ts: Number(r[6]), foto: String(r[7]||''), ubicacion: String(r[8]||''),
+          maps: String(r[9]||''), canal: String(r[10]||'')
+        };
+      });
+      return JSON.stringify({ok:true, log});
+    }
 
-function jidANumero(jid) { return jid.replace("@s.whatsapp.net", ""); }
-
-// Expirar sesiones inactivas
-function iniciarExpiraciones() {
-  setInterval(() => {
-    const ahora = Date.now();
-    for (const [jid, sesion] of sesiones.entries()) {
-      if (ahora - sesion.ultimaActividad > CONFIG.expiracionMin * 60 * 1000) {
-        sesiones.delete(jid);
-        console.log(`⏱️ Sesión expirada: ${jidANumero(jid)}`);
+    if (data.action === 'fichar') {
+      let sheet = ss.getSheetByName('Fichajes');
+      if (!sheet) {
+        sheet = ss.insertSheet('Fichajes');
+        sheet.appendRow(['ID Empleado','Empleado','Departamento','Tipo','Hora','Fecha','Timestamp','Foto','Ubicacion','Maps','Canal']);
       }
-    }
-  }, 60000);
-}
-
-// ─────────────────────────────────────────────
-// 🤖 LÓGICA PRINCIPAL
-// ─────────────────────────────────────────────
-async function procesarMensaje(sock, msg) {
-  const jid = msg.key.remoteJid;
-  const tipo = Object.keys(msg.message || {})[0];
-  const sesion = getSesion(jid);
-
-  // Extraer texto
-  const texto = (
-    msg.message?.conversation ||
-    msg.message?.extendedTextMessage?.text ||
-    ""
-  ).trim().toLowerCase();
-  console.log(`📝 Texto extraido: "${texto}" | sesion previa: ${sesion ? sesion.paso : 'ninguna'}`);
-
-  // JID real para IDENTIFICAR y para RESPONDER (WhatsApp a veces oculta el
-  // numero real detras de un "@lid"; el numero de verdad viene en senderPn).
-  const jidEnvio = msg.key.senderPn || jid;
-  const numero = jidANumero(jidEnvio);
-
-  // ── COMANDO INICIAL ──────────────────────────
-  if (!sesion && (texto === "fichar" || texto === "hola" || texto === "fichaje")) {
-    console.log(`🔍 Buscando empleado para numero: ${numero} (jid original: ${jid})`);
-    const empleados = await sheetsGetEmpleados();
-    const empleado = empleados.find(e => {
-      const telSheet = String(e.telefono || "").replace(/\D/g, "");
-      const telWA = numero.replace(/\D/g, "");
-      return telSheet.slice(-10) === telWA.slice(-10);
-    });
-
-    if (!empleado) {
-      console.log(`❌ No se encontro empleado con ese numero.`);
-      return `❌ Tu número no está registrado en el sistema de fichaje de *Hostel Che*.\n\nContacta a RRHH para que te den de alta.`;
+      sheet.appendRow([data.empId, data.nombre, data.dept, data.tipo, data.hora, data.fecha, Number(data.ts), data.foto||'No', data.ubicacion||'', data.maps||'', data.canal||'Tablet']);
+      return JSON.stringify({ok:true});
     }
 
-    console.log(`✅ Empleado encontrado: ${empleado.name} (id ${empleado.id})`);
-    setSesion(jid, { paso: "esperando_foto", empleadoId: empleado.id, jidEnvio });
-    return `👋 *Hola ${empleado.name}!*\n\n📸 Para registrar tu fichaje, primero envíame una *selfie* (foto tuya en este momento).`;
-  }
-
-  if (!sesion) {
-    return `👋 Escribe *fichar* para registrar tu entrada o salida.`;
-  }
-
-  // ── PASO 1: ESPERANDO FOTO ───────────────────
-  if (sesion.paso === "esperando_foto") {
-    const esImagen = tipo === "imageMessage";
-    if (!esImagen) {
-      setSesion(jid, sesion);
-      return `📸 Necesito que me envíes una *selfie* (foto). Por favor tómate una foto y envíala.`;
-    }
-
-    // Guardar foto en memoria (no en disco: Railway borra el disco en cada redeploy)
-    let fotoBuffer = null;
-    try {
-      fotoBuffer = await downloadMediaMessage(msg, "buffer", {});
-    } catch (e) {
-      console.error("Error descargando foto:", e.message);
-    }
-
-    setSesion(jid, { ...sesion, paso: "esperando_ubicacion", fotoBuffer });
-    return `✅ Foto recibida.\n\n📍 Ahora comparte tu *ubicación actual*.\n\n_En WhatsApp: pulsa el clip 📎 → Ubicación → Enviar mi ubicación actual_`;
-  }
-
-  // ── PASO 2: ESPERANDO UBICACIÓN ──────────────
-  if (sesion.paso === "esperando_ubicacion") {
-    const esUbicacion = tipo === "locationMessage";
-    if (!esUbicacion) {
-      setSesion(jid, sesion);
-      return `📍 Necesito tu *ubicación*. Pulsa el clip 📎 → Ubicación → *Enviar mi ubicación actual*.`;
-    }
-
-    const lat = msg.message.locationMessage.degreesLatitude;
-    const lng = msg.message.locationMessage.degreesLongitude;
-    const verificacion = verificarUbicacion(lat, lng);
-
-    if (!verificacion.ok) {
-      delSesion(jid);
-      return `❌ *Ubicación fuera de rango.*\n\nEstás a *${verificacion.distancia}m* de ${verificacion.cercana} (máximo permitido: 50m).\n\nSi crees que es un error, intenta de nuevo con *fichar*.`;
-    }
-
-    // Usar el empleado ya identificado en el paso inicial (por telefono o por @lid)
-    const empleados = await sheetsGetEmpleados();
-    const empleado = empleados.find(e => String(e.id) === String(sesion.empleadoId));
-
-    if (!empleado) {
-      delSesion(jid);
-      return `❌ No se pudo confirmar tu identidad. Escribe *fichar* para intentar de nuevo.`;
-    }
-
-    // Determinar entrada o salida
-    const logHoy = await sheetsGetLogHoy();
-    const registrosEmpleado = logHoy
-      .filter(r => String(r.empId) === String(empleado.id))
-      .sort((a, b) => Number(b.ts) - Number(a.ts));
-    const ultimoRegistro = registrosEmpleado[0];
-    const tipoFichaje = !ultimoRegistro || ultimoRegistro.type === "salida" ? "entrada" : "salida";
-
-    const hora = horaStr();
-    const fecha = fechaStr();
-    const ts = Date.now();
-
-    const [ok] = await Promise.all([
-      sheetsFichar(empleado, tipoFichaje, hora, fecha, ts, verificacion.sede, !!sesion.fotoBuffer),
-      sesion.fotoBuffer ? subirFotoADrive(sesion.fotoBuffer, empleado, tipoFichaje) : Promise.resolve(false),
-    ]);
-    delSesion(jid);
-
-    const emoji = tipoFichaje === "entrada" ? "🟢" : "🔴";
-    const accion = tipoFichaje === "entrada" ? "Entrada registrada" : "Salida registrada";
-
-    if (ok) {
-      return `${emoji} *${accion}*\n\n👤 ${empleado.name}\n🏨 ${verificacion.sede}\n🕐 ${hora} — ${fecha}\n\n_Guardado en el sistema ✓_`;
-    } else {
-      return `⚠️ Fichaje registrado pero hubo un error al sincronizar. Contacta a sistemas.`;
-    }
-  }
-
-  return null;
-}
-
-// ─────────────────────────────────────────────
-// 📋 REPORTE DIARIO (20:00)
-// ─────────────────────────────────────────────
-function iniciarReporteDiario(sock) {
-  setInterval(async () => {
-    const ahora = new Date().toLocaleTimeString("es-MX", {
-      timeZone: CONFIG.timeZone, hour: "2-digit", minute: "2-digit", hour12: false
-    });
-    if (ahora !== "20:00") return;
-
-    try {
-      const log = await sheetsGetLogHoy();
-      if (!log.length) return;
-
-      const empleados = await sheetsGetEmpleados();
-      const hoy = fechaStr();
-      let reporte = `📋 *Reporte de asistencia — ${hoy}*\n\n`;
-
-      const porEmpleado = {};
-      for (const r of log) {
-        const emp = empleados.find(e => String(e.id) === String(r.empId));
-        const nombre = emp ? emp.name : r.nombre || "Desconocido";
-        if (!porEmpleado[nombre]) porEmpleado[nombre] = [];
-        porEmpleado[nombre].push(r);
+    if (data.action === 'add_empleado') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) {
+        sheet = ss.insertSheet('Empleados');
+        sheet.appendRow(['ID','Nombre','Apellido','Genero','Puesto','Departamento','Sede','FechaIngreso','Telefono','Email','CURP','RFC','Direccion','ContactoEmergencia','TelefonoEmergencia','PIN','Color','Foto','Estado','DriveURL','FechaNacimiento','SinGPS','TelegramID','SinFoto','PuedeHomeOffice']);
       }
-
-      for (const [nombre, registros] of Object.entries(porEmpleado)) {
-        const entradas = registros.filter(r => r.type === "entrada");
-        const salidas = registros.filter(r => r.type === "salida");
-        const entrada = entradas[0]?.hora || "—";
-        const salida = salidas[salidas.length - 1]?.hora || "Sin salida";
-        reporte += `👤 *${nombre}*\n   ▶ Entrada: ${entrada} | ◀ Salida: ${salida}\n\n`;
+      const driveUrl = crearCarpetaEmpleado(data.nombre, data.apellido, data.id);
+      sheet.appendRow([
+        data.id, data.nombre, data.apellido||'', data.genero||'',
+        data.puesto||'', data.dept||'', data.sede||'', data.fechaIngreso||'',
+        data.telefono||'', data.email||'', data.curp||'', data.rfc||'',
+        data.direccion||'', data.contactoEmergencia||'', data.telefonoEmergencia||'',
+        data.pin||'0000', data.color||0, data.foto||'', data.estado||'activo', driveUrl,
+        data.fechaNacimiento||'', String(data.sinGPS)==='true'?'Si':'No', '',
+        String(data.sinFoto)==='true'?'Si':'No',
+        String(data.puedeHomeOffice)==='true'?'Si':'No'
+      ]);
+      if (data.email) {
+        enviarCorreoCredenciales({
+          id: data.id, nombre: data.nombre, apellido: data.apellido||'',
+          email: data.email, pin: data.pin||'0000',
+        });
       }
-
-      await sock.sendMessage(`${CONFIG.numeroAdmin}@s.whatsapp.net`, { text: reporte });
-    } catch (e) {
-      console.error("Error reporte diario:", e.message);
+      return JSON.stringify({ok:true, driveUrl});
     }
-  }, 60000);
-}
 
-// ─────────────────────────────────────────────
-// 🔌 CONEXIÓN BAILEYS
-// ─────────────────────────────────────────────
-async function conectar() {
-  const { state, saveCreds } = await useMultiFileAuthState("auth_rrhh");
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", ({ connection, lastDisconnect, qr }) => {
-    if (qr) {
-      console.log("\n📱 Escanea este QR con WhatsApp:\n");
-      qrcode.generate(qr, { small: true });
+    if (data.action === 'update_empleado') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ok:false, error:'No existe hoja Empleados'});
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.id)) {
+          const driveUrl = data.driveUrl || String(rows[i][19]||'');
+          const fechaNac = data.fechaNacimiento !== undefined ? data.fechaNacimiento : String(rows[i][20]||'');
+          const sinGPS = data.sinGPS !== undefined ? (String(data.sinGPS)==='true'?'Si':'No') : String(rows[i][21]||'No');
+          const sinFoto = data.sinFoto !== undefined ? (String(data.sinFoto)==='true'?'Si':'No') : String(rows[i][23]||'No');
+          const puedeHomeOffice = data.puedeHomeOffice !== undefined ? (String(data.puedeHomeOffice)==='true'?'Si':'No') : String(rows[i][24]||'No');
+          sheet.getRange(i+1, 1, 1, 22).setValues([[
+            data.id, data.nombre, data.apellido||'', data.genero||'',
+            data.puesto||'', data.dept||'', data.sede||'', data.fechaIngreso||'',
+            data.telefono||'', data.email||'', data.curp||'', data.rfc||'',
+            data.direccion||'', data.contactoEmergencia||'', data.telefonoEmergencia||'',
+            data.pin||'0000', data.color||0, data.foto||'', data.estado||'activo', driveUrl,
+            fechaNac, sinGPS
+          ]]);
+          sheet.getRange(i+1, 24).setValue(sinFoto);
+          sheet.getRange(i+1, 25).setValue(puedeHomeOffice);
+          return JSON.stringify({ok:true});
+        }
+      }
+      return JSON.stringify({ok:false, error:'Empleado no encontrado'});
     }
-    if (connection === "close") {
-      const shouldReconnect =
-        new Boom(lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log("🔄 Reconectando:", shouldReconnect);
-      if (shouldReconnect) setTimeout(conectar, 3000);
-      else console.log("❌ Sesión cerrada. Borra auth_rrhh/ y reinicia.");
-    }
-    if (connection === "open") {
-      console.log("\n✅ Bot RRHH conectado!\n");
-      iniciarExpiraciones();
-      iniciarReporteDiario(sock);
-    }
-  });
 
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-    for (const msg of messages) {
-      try {
-        if (msg.key.fromMe) continue;
-        if (!msg.message) continue;
-        // Solo mensajes privados
-        if (msg.key.remoteJid?.endsWith("@g.us")) continue;
-        const tipoMsg = Object.keys(msg.message)[0];
-        const ignorados = ["protocolMessage", "reactionMessage", "pollUpdateMessage", "senderKeyDistributionMessage"];
-        if (ignorados.includes(tipoMsg)) continue;
-
-        const jid = msg.key.remoteJid;
-        const jidEnvio = msg.key.senderPn || jid;
-        const nombre = msg.pushName || jidANumero(jidEnvio);
-        console.log(`📨 ${nombre}: ${tipoMsg}`);
-
-        const respuesta = await procesarMensaje(sock, msg);
-        console.log(`💬 Respuesta generada: ${respuesta ? respuesta.slice(0,60) : '(null, no responde)'}`);
-        if (respuesta) {
-          try {
-            await sock.sendMessage(jidEnvio, { text: respuesta });
-            console.log(`📤 Mensaje enviado a ${jidANumero(jidEnvio)} (jid original: ${jid})`);
-          } catch (sendErr) {
-            console.error(`🔴 Error al enviar mensaje:`, sendErr.message);
+    if (data.action === 'crear_carpeta') {
+      const driveUrl = crearCarpetaEmpleado(data.nombre, data.apellido, data.id);
+      if (driveUrl) {
+        let sheet = ss.getSheetByName('Empleados');
+        const rows = sheet.getDataRange().getValues();
+        for (let i = 1; i < rows.length; i++) {
+          if (String(rows[i][0]) === String(data.id)) {
+            sheet.getRange(i+1, 20).setValue(driveUrl);
+            break;
           }
         }
-      } catch (error) {
-        console.error("❌ Error:", error.message);
+      }
+      return JSON.stringify({ok:true, driveUrl});
+    }
+
+    if (data.action === 'del_empleado') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ok:true});
+      const rows = sheet.getDataRange().getValues();
+      for (let i = rows.length - 1; i >= 1; i--) {
+        if (String(rows[i][0]) === String(data.id)) {
+          const driveUrl = String(rows[i][19] || '');
+          const match = driveUrl.match(/folders\/([a-zA-Z0-9_-]+)/);
+          if (match) {
+            try { DriveApp.getFolderById(match[1]).setTrashed(true); } catch (e) {}
+          }
+          sheet.deleteRow(i + 1);
+        }
+      }
+      return JSON.stringify({ok:true});
+    }
+
+    if (data.action === 'subir_foto') {
+      try {
+        const b64 = decodeURIComponent(data.b64);
+        const base64Data = b64.replace(/^data:image\/(png|jpg|jpeg|gif);base64,/, '');
+        const mimeType = b64.match(/data:(image\/\w+);/)[1];
+        const blob = Utilities.newBlob(Utilities.base64Decode(base64Data), mimeType, `foto_perfil.jpg`);
+
+        const carpetaRaiz = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+        const nombre = data.nombre || '';
+        const apellido = data.apellido || '';
+        const id = data.id || '';
+        const nombreCarpeta = `${nombre} ${apellido} [${id}]`.trim();
+
+        let carpetaEmp;
+        const existing = carpetaRaiz.getFoldersByName(nombreCarpeta);
+        if (existing.hasNext()) {
+          carpetaEmp = existing.next();
+        } else {
+          carpetaEmp = carpetaRaiz.createFolder(nombreCarpeta);
+        }
+
+        const archivos = carpetaEmp.getFilesByName('foto_perfil.jpg');
+        while (archivos.hasNext()) archivos.next().setTrashed(true);
+
+        const file = carpetaEmp.createFile(blob);
+        file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+        const url = `https://drive.google.com/uc?id=${file.getId()}`;
+
+        const sheet = ss.getSheetByName('Empleados');
+        if (sheet) {
+          const rows = sheet.getDataRange().getValues();
+          for (let i = 1; i < rows.length; i++) {
+            if (String(rows[i][0]) === String(id)) {
+              sheet.getRange(i+1, 18).setValue(url);
+              break;
+            }
+          }
+        }
+        return JSON.stringify({ok: true, url});
+      } catch(e) {
+        return JSON.stringify({ok: false, error: e.message});
       }
     }
+
+    if (data.action === 'guardar_foto_perfil_drive') return guardarFotoPerfilDrive(data);
+    if (data.action === 'guardar_selfie_fichaje') return guardarSelfieFichaje(data);
+
+    if (data.action === 'guardar_telegram_id') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ ok: false, error: 'No existe hoja Empleados' });
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.id)) {
+          sheet.getRange(i + 1, 23).setValue(String(data.telegramId));
+          return JSON.stringify({ ok: true });
+        }
+      }
+      return JSON.stringify({ ok: false, error: 'Empleado no encontrado' });
+    }
+
+    if (data.action === 'get_empleado_por_telegram_id') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ ok: false, error: 'No existe hoja Empleados' });
+      const tz = Session.getScriptTimeZone() || 'America/Cancun';
+      const fmtFecha = v => v instanceof Date ? Utilities.formatDate(v, tz, 'dd/MM/yyyy') : String(v || '');
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][22] || '') === String(data.telegramId)) {
+          const r = rows[i];
+          return JSON.stringify({ ok: true, empleado: {
+            id: String(r[0]), name: String(r[1]), apellido: String(r[2] || ''),
+            genero: String(r[3] || ''), puesto: String(r[4] || ''), dept: String(r[5] || ''),
+            sede: String(r[6] || ''), fechaIngreso: fmtFecha(r[7]),
+            telefono: String(r[8] || ''), email: String(r[9] || ''),
+            foto: String(r[17] || ''), estado: String(r[18] || 'activo'),
+            fechaNacimiento: fmtFecha(r[20]), sinGPS: String(r[21] || '').toLowerCase() === 'si',
+          }});
+        }
+      }
+      return JSON.stringify({ ok: false, error: 'No encontrado' });
+    }
+
+    if (data.action === 'get_homeoffice') {
+      let sheet = ss.getSheetByName('HomeOffice');
+      if (!sheet) return JSON.stringify({ ok: true, dias: [] });
+      const rows = sheet.getDataRange().getValues();
+      const dias = rows.slice(1).filter(r => r[0] && r[1]).map(r => ({
+        empId: String(r[0]), fecha: String(r[1]),
+      }));
+      return JSON.stringify({ ok: true, dias });
+    }
+
+    if (data.action === 'toggle_homeoffice') {
+      let sheet = ss.getSheetByName('HomeOffice');
+      if (!sheet) {
+        sheet = ss.insertSheet('HomeOffice');
+        sheet.appendRow(['ID Empleado', 'Fecha']);
+      }
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.empId) && String(rows[i][1]) === String(data.fecha)) {
+          sheet.deleteRow(i + 1);
+          return JSON.stringify({ ok: true, activo: false });
+        }
+      }
+      sheet.appendRow([data.empId, data.fecha]);
+      return JSON.stringify({ ok: true, activo: true });
+    }
+
+    if (data.action === 'marcar_homeoffice_hoy') {
+      let sheet = ss.getSheetByName('HomeOffice');
+      if (!sheet) {
+        sheet = ss.insertSheet('HomeOffice');
+        sheet.appendRow(['ID Empleado', 'Fecha']);
+      }
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.empId) && String(rows[i][1]) === String(data.fecha)) {
+          return JSON.stringify({ ok: true, yaEstaba: true });
+        }
+      }
+      sheet.appendRow([data.empId, data.fecha]);
+      return JSON.stringify({ ok: true, yaEstaba: false });
+    }
+
+    if (data.action === 'guardar_homeoffice_lote') {
+      let sheet = ss.getSheetByName('HomeOffice');
+      if (!sheet) {
+        sheet = ss.insertSheet('HomeOffice');
+        sheet.appendRow(['ID Empleado', 'Fecha']);
+      }
+      let cambios = [];
+      try { cambios = JSON.parse(data.cambios); } catch (e) { return JSON.stringify({ ok: false, error: 'Datos invalidos' }); }
+
+      const rows = sheet.getDataRange().getValues();
+      const filasABorrar = [];
+      const fechasExistentes = new Set();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.empId)) fechasExistentes.add(String(rows[i][1]));
+      }
+
+      const aAgregar = [];
+      for (const c of cambios) {
+        if (c.accion === 'add' && !fechasExistentes.has(c.fecha)) {
+          aAgregar.push(c.fecha);
+        } else if (c.accion === 'remove') {
+          for (let i = 1; i < rows.length; i++) {
+            if (String(rows[i][0]) === String(data.empId) && String(rows[i][1]) === c.fecha) {
+              filasABorrar.push(i + 1);
+            }
+          }
+        }
+      }
+
+      // Borrar de mayor a menor indice para no correr las filas restantes
+      filasABorrar.sort((a, b) => b - a).forEach(fila => sheet.deleteRow(fila));
+      aAgregar.forEach(fecha => sheet.appendRow([data.empId, fecha]));
+
+      return JSON.stringify({ ok: true, agregados: aAgregar.length, quitados: filasABorrar.length });
+    }
+
+    if (data.action === 'enviar_credenciales') {
+      let sheet = ss.getSheetByName('Empleados');
+      if (!sheet) return JSON.stringify({ok:false, error:'No existe hoja Empleados'});
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(data.id)) {
+          const emp = {
+            id: String(rows[i][0]), nombre: String(rows[i][1]), apellido: String(rows[i][2]||''),
+            email: String(rows[i][9]||''), pin: String(rows[i][15]||'0000'),
+          };
+          if (!emp.email) return JSON.stringify({ok:false, error:'Este empleado no tiene correo registrado'});
+          enviarCorreoCredenciales(emp);
+          return JSON.stringify({ok:true});
+        }
+      }
+      return JSON.stringify({ok:false, error:'Empleado no encontrado'});
+    }
+
+    return JSON.stringify({ok:false, error:'Accion desconocida'});
+  } catch(err) {
+    return JSON.stringify({ok:false, error:err.message});
+  }
+}
+
+function limpiarFichajes() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  let sheet = ss.getSheetByName('Fichajes');
+  if (!sheet) { Logger.log('No existe Fichajes'); return; }
+  const rows = sheet.getDataRange().getValues();
+  const limpios = [];
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    if (String(r[0]).toLowerCase().includes('empleado') || String(r[1]).toLowerCase().includes('departamento')) continue;
+    let id='',nombre='',dept='',tipo='',hora='',fecha='',ts='',foto='',ubicacion='',maps='',canal='';
+    if (String(r[0]).length > 8 && isNaN(Number(r[1])) && r[1] !== '') {
+      id=String(r[0]);nombre=String(r[1]);dept=String(r[2]);tipo=String(r[3]);
+      hora=String(r[4]);fecha=String(r[5]);ts=String(r[6]);foto=String(r[7]||'');
+      ubicacion=String(r[8]||'');maps=String(r[9]||'');canal=String(r[10]||'');
+    } else if (r[0] !== '' && isNaN(Number(r[0]))) {
+      id='';nombre=String(r[0]);dept=String(r[1]);tipo=String(r[2]);
+      hora=String(r[3]);fecha=String(r[4]);ts=String(r[5]);foto='';ubicacion='';maps='';canal='';
+    } else { continue; }
+    if (nombre && tipo && hora) limpios.push([id,nombre,dept,tipo,hora,fecha,ts,foto,ubicacion,maps,canal]);
+  }
+  sheet.clearContents();
+  sheet.appendRow(['ID Empleado','Empleado','Departamento','Tipo','Hora','Fecha','Timestamp','Foto','Ubicacion','Maps','Canal']);
+  limpios.forEach(r => sheet.appendRow(r));
+  Logger.log('Listo. Filas: ' + limpios.length);
+}
+
+// ─────────────────────────────────────────────
+// 🎂 CUMPLEAÑOS — enviar saludo por correo
+// ─────────────────────────────────────────────
+
+// Mientras testeas, usa sistemas@hostelche.com.mx.
+// Cuando quede validado, cambia a grupoche@hostelche.com.mx
+const CUMPLE_DESTINATARIOS = ['grupoche@hostelche.com.mx'];
+
+function revisarCumpleanos() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheet = ss.getSheetByName('Empleados');
+  if (!sheet) return;
+
+  const rows = sheet.getDataRange().getValues();
+  const hoy = new Date();
+  const tz = Session.getScriptTimeZone() || 'America/Cancun';
+  const hoyDia = Number(Utilities.formatDate(hoy, tz, 'd'));
+  const hoyMes = Number(Utilities.formatDate(hoy, tz, 'M'));
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const id = r[0];
+    if (!id) continue;
+
+    const estado = String(r[18] || '').toLowerCase();
+    if (estado && estado !== 'activo') continue;
+
+    const fechaNac = r[20];
+    if (!fechaNac) continue;
+
+    let dia, mes;
+    if (fechaNac instanceof Date) {
+      dia = fechaNac.getDate();
+      mes = fechaNac.getMonth() + 1;
+    } else {
+      const partes = String(fechaNac).split(/[\/\-]/).map(Number);
+      if (partes.length < 3) continue;
+      if (partes[0] > 31) {
+        mes = partes[1]; dia = partes[2];
+      } else {
+        dia = partes[0]; mes = partes[1];
+      }
+    }
+
+    if (dia === hoyDia && mes === hoyMes) {
+      enviarCorreoCumpleanos({
+        nombre: String(r[1] || ''),
+        apellido: String(r[2] || ''),
+        puesto: String(r[4] || ''),
+        sede: String(r[6] || ''),
+        foto: String(r[17] || ''),
+      });
+    }
+  }
+}
+
+function enviarCorreoCumpleanos(emp) {
+  const nombreCompleto = (emp.nombre + ' ' + emp.apellido).trim();
+  const fotoHtml = emp.foto && emp.foto.startsWith('http')
+    ? `<img src="${emp.foto}" width="120" height="120" style="border-radius:50%;object-fit:cover;display:block;margin:0 auto 20px;border:4px solid #1D9E75;" />`
+    : `<div style="width:120px;height:120px;border-radius:50%;background:#f0ede8;margin:0 auto 20px;display:flex;align-items:center;justify-content:center;font-size:40px;color:#1D9E75;font-weight:600;">${(emp.nombre[0]||'')}${(emp.apellido[0]||'')}</div>`;
+
+  const html = `
+  <div style="background:#f5f4f0;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <div style="max-width:420px;margin:0 auto;background:#ffffff;border-radius:20px;padding:36px 28px;border:1px solid #e8e6e0;text-align:center;">
+      <div style="font-size:11px;font-weight:600;color:#aaaaaa;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:24px;">Hostel Che</div>
+      <div style="font-size:40px;margin-bottom:8px;">&#127881;&#127874;&#127880;</div>
+      ${fotoHtml}
+      <div style="font-size:22px;font-weight:600;color:#1a1a1a;margin-bottom:4px;">¡Feliz cumpleaños, ${emp.nombre}!</div>
+      <div style="font-size:14px;color:#aaaaaa;margin-bottom:20px;">${emp.puesto || ''}${emp.puesto && emp.sede ? ' · ' : ''}${emp.sede || ''}</div>
+      <div style="font-size:15px;color:#444444;line-height:1.6;margin-bottom:8px;">
+        Todo el equipo de <strong>Hostel Che</strong> te desea un día increíble.<br/>
+        Gracias por ser parte de esta familia. &#127796;
+      </div>
+      <div style="margin-top:28px;padding-top:20px;border-top:1px solid #f0ede8;font-size:12px;color:#cccccc;">
+        ${nombreCompleto}
+      </div>
+    </div>
+  </div>`;
+
+  GmailApp.sendEmail(CUMPLE_DESTINATARIOS.join(','), `Hoy cumple años ${nombreCompleto} - Hostel Che`, '', {
+    htmlBody: html,
+    from: 'rrhh@hostelche.com.mx',
+    name: 'Hostel Che',
   });
 }
 
-console.log("🏨 Bot RRHH — Hostel Che\n");
-conectar();
+// ─────────────────────────────────────────────
+// 🎉 ANIVERSARIO LABORAL — enviar saludo por correo
+// ─────────────────────────────────────────────
+
+// Mientras testeas, usa maximiliano@hostelche.com.mx.
+// Cuando quede validado, cambia a grupoche@hostelche.com.mx
+const ANIVERSARIO_DESTINATARIOS = ['grupoche@hostelche.com.mx'];
+
+function revisarAniversarios() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheet = ss.getSheetByName('Empleados');
+  if (!sheet) return;
+
+  const rows = sheet.getDataRange().getValues();
+  const hoy = new Date();
+  const tz = Session.getScriptTimeZone() || 'America/Cancun';
+  const hoyDia = Number(Utilities.formatDate(hoy, tz, 'd'));
+  const hoyMes = Number(Utilities.formatDate(hoy, tz, 'M'));
+  const hoyAnio = Number(Utilities.formatDate(hoy, tz, 'yyyy'));
+
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const id = r[0];
+    if (!id) continue;
+
+    const estado = String(r[18] || '').toLowerCase();
+    if (estado && estado !== 'activo') continue;
+
+    const fechaIngreso = r[7];
+    if (!fechaIngreso) continue;
+
+    let dia, mes, anio;
+    if (fechaIngreso instanceof Date) {
+      dia = fechaIngreso.getDate();
+      mes = fechaIngreso.getMonth() + 1;
+      anio = fechaIngreso.getFullYear();
+    } else {
+      const partes = String(fechaIngreso).split(/[\/\-]/).map(Number);
+      if (partes.length < 3) continue;
+      if (partes[0] > 31) {
+        anio = partes[0]; mes = partes[1]; dia = partes[2];
+      } else if (partes[2] > 31) {
+        dia = partes[0]; mes = partes[1]; anio = partes[2];
+      } else {
+        continue;
+      }
+    }
+
+    const anios = hoyAnio - anio;
+    if (dia === hoyDia && mes === hoyMes && anios >= 1) {
+      enviarCorreoAniversario({
+        nombre: String(r[1] || ''),
+        apellido: String(r[2] || ''),
+        puesto: String(r[4] || ''),
+        sede: String(r[6] || ''),
+        foto: String(r[17] || ''),
+        anios: anios,
+      });
+    }
+  }
+}
+
+function enviarCorreoAniversario(emp) {
+  const nombreCompleto = (emp.nombre + ' ' + emp.apellido).trim();
+  const fotoHtml = emp.foto && emp.foto.startsWith('http')
+    ? `<img src="${emp.foto}" width="120" height="120" style="border-radius:50%;object-fit:cover;display:block;margin:0 auto 20px;border:4px solid #1D9E75;" />`
+    : `<div style="width:120px;height:120px;border-radius:50%;background:#f0ede8;margin:0 auto 20px;display:flex;align-items:center;justify-content:center;font-size:40px;color:#1D9E75;font-weight:600;">${(emp.nombre[0]||'')}${(emp.apellido[0]||'')}</div>`;
+
+  const textoAnios = emp.anios === 1 ? '1 año' : `${emp.anios} años`;
+
+  const html = `
+  <div style="background:#f5f4f0;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <div style="max-width:420px;margin:0 auto;background:#ffffff;border-radius:20px;padding:36px 28px;border:1px solid #e8e6e0;text-align:center;">
+      <div style="font-size:11px;font-weight:600;color:#aaaaaa;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:24px;">Hostel Che</div>
+      <div style="font-size:40px;margin-bottom:8px;">&#127881;&#127942;&#127880;</div>
+      ${fotoHtml}
+      <div style="display:inline-block;padding:5px 16px;border-radius:20px;background:#1D9E75;color:#ffffff;font-size:13px;font-weight:600;margin-bottom:12px;">${textoAnios} en Hostel Che</div>
+      <div style="font-size:22px;font-weight:600;color:#1a1a1a;margin-bottom:4px;">¡Feliz aniversario, ${emp.nombre}!</div>
+      <div style="font-size:14px;color:#aaaaaa;margin-bottom:20px;">${emp.puesto || ''}${emp.puesto && emp.sede ? ' · ' : ''}${emp.sede || ''}</div>
+      <div style="font-size:15px;color:#444444;line-height:1.6;margin-bottom:8px;">
+        Gracias por ${textoAnios} de dedicacion y por ser parte fundamental de <strong>Hostel Che</strong>.<br/>
+        Celebramos este camino juntos. &#127796;
+      </div>
+      <div style="margin-top:28px;padding-top:20px;border-top:1px solid #f0ede8;font-size:12px;color:#cccccc;">
+        ${nombreCompleto}
+      </div>
+    </div>
+  </div>`;
+
+  GmailApp.sendEmail(ANIVERSARIO_DESTINATARIOS.join(','), `Hoy cumple ${emp.anios === 1 ? '1 año' : emp.anios + ' años'} en Hostel Che ${nombreCompleto}`, '', {
+    htmlBody: html,
+    from: 'rrhh@hostelche.com.mx',
+    name: 'Hostel Che',
+  });
+}
+
+// ─────────────────────────────────────────────
+// 🔑 CREDENCIALES — enviar link + PIN por correo
+// ─────────────────────────────────────────────
+
+function enviarCorreoCredenciales(emp) {
+  const link = `${FICHAR_BASE_URL}?id=${encodeURIComponent(emp.id)}`;
+  const nombreCompleto = (emp.nombre + ' ' + (emp.apellido||'')).trim();
+
+  const html = `
+  <div style="background:#f5f4f0;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <div style="max-width:440px;margin:0 auto;background:#ffffff;border-radius:20px;padding:36px 28px;border:1px solid #e8e6e0;text-align:center;">
+      <div style="font-size:11px;font-weight:600;color:#aaaaaa;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:20px;">Hostel Che &middot; Fichaje</div>
+      <div style="font-size:20px;font-weight:600;color:#1a1a1a;margin-bottom:6px;">Hola, ${emp.nombre}</div>
+      <div style="font-size:14px;color:#888888;line-height:1.5;margin-bottom:24px;">
+        Este es tu acceso personal para registrar tu entrada y salida en Hostel Che.
+      </div>
+
+      <a href="${link}" style="display:inline-block;background:#1D9E75;color:#ffffff;text-decoration:none;font-weight:600;font-size:15px;padding:14px 28px;border-radius:14px;margin-bottom:20px;">Abrir mi fichaje</a>
+
+      <div style="font-size:12px;color:#aaaaaa;word-break:break-all;margin-bottom:24px;">${link}</div>
+
+      <div style="background:#f5f4f0;border-radius:14px;padding:18px;margin-bottom:20px;">
+        <div style="font-size:11px;color:#aaaaaa;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px;">Tu PIN de acceso</div>
+        <div style="font-size:28px;font-weight:700;color:#1a1a1a;letter-spacing:0.15em;">${emp.pin}</div>
+      </div>
+
+      <div style="text-align:left;border-top:1px solid #f0ede8;padding-top:20px;margin-top:4px;">
+        <div style="font-size:11px;font-weight:600;color:#aaaaaa;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:12px;">Como funciona</div>
+        <div style="font-size:13px;color:#444444;line-height:1.6;">
+          <div style="margin-bottom:10px;"><strong>1.</strong> Abre tu link personal e ingresa tu PIN de 4 digitos.</div>
+          <div style="margin-bottom:10px;"><strong>2.</strong> La primera vez, te vamos a pedir una foto tuya de frente (con la camara). Esa foto se usa despues para verificar tu identidad cada vez que fiches.</div>
+          <div style="margin-bottom:10px;"><strong>3.</strong> Para fichar entrada o salida, toma una selfie y confirma tu ubicacion (debes estar dentro de tu sede).</div>
+          <div style="margin-bottom:0;"><strong>4.</strong> En la pestana "Mi perfil" puedes ver y actualizar tus datos cuando quieras.</div>
+        </div>
+      </div>
+
+      <div style="font-size:12px;color:#cccccc;margin-top:20px;">
+        Guarda este correo. Si pierdes tu PIN, pide a IT que te lo reenvie.
+      </div>
+    </div>
+  </div>`;
+
+  GmailApp.sendEmail(emp.email, `Tu acceso a fichaje - Hostel Che`, '', {
+    htmlBody: html,
+    from: 'rrhh@hostelche.com.mx',
+    name: 'Hostel Che',
+  });
+}
+
+// ─────────────────────────────────────────────
+// 📸 RECONOCIMIENTO FACIAL — respaldo de fotos en Drive
+// ─────────────────────────────────────────────
+
+function obtenerCarpetaEmpleado(empId, nombre, apellido) {
+  try {
+    const ss = SpreadsheetApp.openById(SHEET_ID);
+    const sheet = ss.getSheetByName('Empleados');
+    if (sheet) {
+      const rows = sheet.getDataRange().getValues();
+      for (let i = 1; i < rows.length; i++) {
+        if (String(rows[i][0]) === String(empId)) {
+          const driveUrl = String(rows[i][19] || '');
+          const match = driveUrl.match(/folders\/([a-zA-Z0-9_-]+)/);
+          if (match) {
+            try { return DriveApp.getFolderById(match[1]); } catch (e) {}
+          }
+          break;
+        }
+      }
+    }
+  } catch (e) {}
+  const carpetaRaiz = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const nombreCarpeta = `${nombre} ${apellido || ''} [${empId}]`.trim();
+  const existing = carpetaRaiz.getFoldersByName(nombreCarpeta);
+  if (existing.hasNext()) return existing.next();
+  return carpetaRaiz.createFolder(nombreCarpeta);
+}
+
+function obtenerSubcarpeta(carpetaPadre, nombreSub) {
+  const existing = carpetaPadre.getFoldersByName(nombreSub);
+  if (existing.hasNext()) return existing.next();
+  return carpetaPadre.createFolder(nombreSub);
+}
+
+function decodificarImagenB64(b64raw) {
+  const data = decodeURIComponent(b64raw);
+  const match = data.match(/^data:([^;]+);base64,(.*)$/);
+  if (!match) return null;
+  return { mimeType: match[1], bytes: Utilities.base64Decode(match[2]) };
+}
+
+function guardarFotoPerfilDrive(data) {
+  try {
+    const carpeta = obtenerCarpetaEmpleado(data.id, data.nombre, data.apellido);
+    const img = decodificarImagenB64(data.b64);
+    if (!img) return JSON.stringify({ ok: false, error: 'Formato de imagen invalido' });
+    const blob = Utilities.newBlob(img.bytes, img.mimeType, 'foto_perfil.jpg');
+    const existentes = carpeta.getFilesByName('foto_perfil.jpg');
+    while (existentes.hasNext()) existentes.next().setTrashed(true);
+    const file = carpeta.createFile(blob);
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    return JSON.stringify({ ok: true, url: file.getUrl() });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: err.message });
+  }
+}
+
+function guardarSelfieFichaje(data) {
+  try {
+    const carpetaEmp = obtenerCarpetaEmpleado(data.empId, data.nombre, data.apellido);
+    const carpetaSelfies = obtenerSubcarpeta(carpetaEmp, 'Selfies fichaje');
+    const img = decodificarImagenB64(data.b64);
+    if (!img) return JSON.stringify({ ok: false, error: 'Formato de imagen invalido' });
+    const fechaSafe = String(data.fecha || '').replace(/\//g, '-');
+    const horaSafe = String(data.hora || '').replace(/:/g, '-');
+    const nombreArchivo = `fichaje_${fechaSafe}_${horaSafe}_${data.tipo || ''}.jpg`;
+    const blob = Utilities.newBlob(img.bytes, img.mimeType, nombreArchivo);
+    carpetaSelfies.createFile(blob);
+    limpiarSelfiesDeCarpeta(carpetaSelfies);
+    return JSON.stringify({ ok: true });
+  } catch (err) {
+    return JSON.stringify({ ok: false, error: err.message });
+  }
+}
+
+function limpiarSelfiesDeCarpeta(carpeta) {
+  const limite = new Date();
+  limite.setDate(limite.getDate() - 15);
+  const files = carpeta.getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (f.getDateCreated() < limite) f.setTrashed(true);
+  }
+}
+
+// Funcion para el trigger diario (revisa TODAS las carpetas de empleados)
+function limpiarSelfiesAntiguas() {
+  const raiz = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const carpetas = raiz.getFolders();
+  while (carpetas.hasNext()) {
+    const empCarpeta = carpetas.next();
+    const subs = empCarpeta.getFoldersByName('Selfies fichaje');
+    if (subs.hasNext()) {
+      limpiarSelfiesDeCarpeta(subs.next());
+    }
+  }
+}
+
+// ─────────────────────────────────────────────
+// ⏱️ AUTO-CIERRE DE TURNOS OLVIDADOS (12 horas)
+// ─────────────────────────────────────────────
+// Revisa cada hora si alguien ficho entrada y nunca marco salida.
+// Si ya pasaron 12 horas, registra una salida automatica (para que
+// el reloj deje de correr) y le manda un correo avisando.
+
+const LIMITE_HORAS_TURNO = 12;
+
+function revisarSalidasOlvidadas() {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sheetFichajes = ss.getSheetByName('Fichajes');
+  const sheetEmpleados = ss.getSheetByName('Empleados');
+  if (!sheetFichajes || !sheetEmpleados) return;
+
+  const ahora = Date.now();
+  const limiteMs = LIMITE_HORAS_TURNO * 60 * 60 * 1000;
+  const tz = Session.getScriptTimeZone() || 'America/Cancun';
+
+  const fichajes = sheetFichajes.getDataRange().getValues();
+  const empleadosRows = sheetEmpleados.getDataRange().getValues();
+
+  // Ultimo fichaje por empleado (buscando hacia atras en las ultimas 48h)
+  const ultimoPorEmpleado = {};
+  for (let i = fichajes.length - 1; i >= 1; i--) {
+    const r = fichajes[i];
+    const empId = String(r[0]);
+    const ts = Number(r[6]);
+    if (!empId || !ts) continue;
+    if (ahora - ts > 48 * 60 * 60 * 1000) continue;
+    if (!ultimoPorEmpleado[empId] || ts > ultimoPorEmpleado[empId].ts) {
+      ultimoPorEmpleado[empId] = { tipo: String(r[3]), ts: ts, nombre: String(r[1]), dept: String(r[2]) };
+    }
+  }
+
+  for (const empId in ultimoPorEmpleado) {
+    const ultimo = ultimoPorEmpleado[empId];
+    if (ultimo.tipo !== 'entrada') continue;
+    if (ahora - ultimo.ts < limiteMs) continue;
+
+    // Ya pasaron 12+ horas desde la entrada sin salida: auto-cerrar
+    const tsCierre = ultimo.ts + limiteMs;
+    const fechaCierre = new Date(tsCierre);
+    const horaStr = Utilities.formatDate(fechaCierre, tz, 'HH:mm');
+    const fechaStr = Utilities.formatDate(fechaCierre, tz, 'dd/MM/yyyy');
+
+    sheetFichajes.appendRow([empId, ultimo.nombre, ultimo.dept, 'salida', horaStr, fechaStr, tsCierre, 'No', 'Auto-cierre (turno olvidado)', '', 'Sistema']);
+
+    // Buscar email del empleado para avisarle
+    for (let i = 1; i < empleadosRows.length; i++) {
+      if (String(empleadosRows[i][0]) === empId) {
+        const email = String(empleadosRows[i][9] || '');
+        if (email) {
+          const horaEntrada = Utilities.formatDate(new Date(ultimo.ts), tz, 'HH:mm');
+          const fechaEntrada = Utilities.formatDate(new Date(ultimo.ts), tz, 'dd/MM/yyyy');
+          enviarCorreoTurnoOlvidado(email, ultimo.nombre, fechaEntrada, horaEntrada, horaStr);
+        }
+        break;
+      }
+    }
+  }
+}
+
+function enviarCorreoTurnoOlvidado(email, nombre, fechaEntrada, horaEntrada, horaCierre) {
+  const html = `
+  <div style="background:#f5f4f0;padding:40px 20px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+    <div style="max-width:440px;margin:0 auto;background:#ffffff;border-radius:20px;padding:32px 28px;border:1px solid #e8e6e0;">
+      <div style="font-size:11px;font-weight:600;color:#aaaaaa;letter-spacing:0.12em;text-transform:uppercase;margin-bottom:20px;">Hostel Che &middot; Fichaje</div>
+      <div style="font-size:18px;font-weight:600;color:#1a1a1a;margin-bottom:12px;">Hola ${nombre}, olvidaste marcar tu salida</div>
+      <div style="font-size:14px;color:#444444;line-height:1.6;background:#f5f4f0;padding:14px;border-radius:10px;margin-bottom:16px;">
+        Registraste tu entrada el <strong>${fechaEntrada}</strong> a las <strong>${horaEntrada}</strong>, pero nunca marcaste tu salida.
+        <br/><br/>
+        Tu turno se cerro automaticamente a las <strong>${horaCierre}</strong> (${LIMITE_HORAS_TURNO} horas despues de tu entrada), para que el sistema no siga contando tus horas de mas.
+      </div>
+      <div style="font-size:12px;color:#cccccc;">Recuerda marcar tu salida la proxima vez desde tu link de fichaje o el bot de Telegram.</div>
+    </div>
+  </div>`;
+
+  GmailApp.sendEmail(email, `Olvidaste marcar tu salida - Hostel Che`, '', {
+    htmlBody: html,
+    from: 'rrhh@hostelche.com.mx',
+    name: 'Hostel Che',
+  });
+}
