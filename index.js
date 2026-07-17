@@ -396,6 +396,8 @@ async function conectar() {
     if (qr) {
       console.log("\n📱 Escanea este QR con WhatsApp:\n");
       qrcode.generate(qr, { small: true });
+      const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=${encodeURIComponent(qr)}`;
+      console.log(`\n🔗 Si el QR de arriba no se ve bien, abre este link en tu navegador para verlo como imagen:\n${qrImageUrl}\n`);
     }
     if (connection === "close") {
       const shouldReconnect =
